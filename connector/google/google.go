@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/exp/slices"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/sync/errgroup"
 	admin "google.golang.org/api/admin/directory/v1"
 	"google.golang.org/api/option"
 
@@ -235,8 +236,11 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 
 	var groups []string
 	if s.Groups && c.adminSrv != nil {
-		checkedGroups := make(map[string]struct{})
-		groups, err = c.getGroups(claims.Email, c.fetchTransitiveGroupMembership, checkedGroups)
+		if c.fetchTransitiveGroupMembership {
+			groups, err = c.getAllGroups(ctx, claims.Email)
+		} else {
+			groups, err = c.getGroups(ctx, claims.Email, &sync.Map{})
+		}
 		if err != nil {
 			return identity, fmt.Errorf("google: could not retrieve groups: %v", err)
 		}
@@ -260,25 +264,86 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 	return identity, nil
 }
 
+func (c *googleConnector) getAllGroups(ctx context.Context, userKey string) ([]string, error) {
+	parentGroups, err := c.adminSrv.Groups.List().
+		UserKey(userKey).
+		Domain(c.domain).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return nil, err
+	}
+
+	var groups []string
+	var groupsCh = make(chan string)
+	checkedGroups := sync.Map{}
+	g, cctx := errgroup.WithContext(ctx)
+
+	for _, group := range parentGroups.Groups {
+		email := group.Email
+		g.Go(func() error {
+			childGroups, err := c.getGroups(cctx, email, &checkedGroups)
+			if err != nil {
+				return err
+			}
+
+			childGroups = append(childGroups, email)
+
+			for _, email := range childGroups {
+				select {
+				case groupsCh <- email:
+				case <-cctx.Done():
+					return cctx.Err()
+				}
+			}
+
+			return nil
+		})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-cctx.Done():
+				close(done)
+				return
+			case g := <-groupsCh:
+				groups = append(groups, g)
+			}
+		}
+	}()
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	<-done
+
+	return groups, nil
+}
+
 // getGroups creates a connection to the admin directory service and lists
 // all groups the user is a member of
-func (c *googleConnector) getGroups(email string, fetchTransitiveGroupMembership bool, checkedGroups map[string]struct{}) ([]string, error) {
+func (c *googleConnector) getGroups(ctx context.Context, email string, checkedGroups *sync.Map) ([]string, error) {
 	var userGroups []string
 	var err error
 	groupsList := &admin.Groups{}
 	for {
 		groupsList, err = c.adminSrv.Groups.List().
-			UserKey(email).PageToken(groupsList.NextPageToken).Do()
+			Domain(c.domain).
+			UserKey(email).
+			PageToken(groupsList.NextPageToken).
+			Context(ctx).
+			Do()
 		if err != nil {
 			return nil, fmt.Errorf("could not list groups: %v", err)
 		}
 
 		for _, group := range groupsList.Groups {
-			if _, exists := checkedGroups[group.Email]; exists {
+			if _, ok := checkedGroups.LoadOrStore(group.Email, struct{}{}); ok {
 				continue
 			}
 
-			checkedGroups[group.Email] = struct{}{}
 			// TODO (joelspeed): Make desired group key configurable
 			userGroups = append(userGroups, group.Email)
 
@@ -287,7 +352,7 @@ func (c *googleConnector) getGroups(email string, fetchTransitiveGroupMembership
 			}
 
 			// getGroups takes a user's email/alias as well as a group's email/alias
-			transitiveGroups, err := c.getGroups(group.Email, fetchTransitiveGroupMembership, checkedGroups)
+			transitiveGroups, err := c.getGroups(ctx, group.Email, checkedGroups)
 			if err != nil {
 				return nil, fmt.Errorf("could not list transitive groups: %v", err)
 			}
