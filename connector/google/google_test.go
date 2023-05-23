@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/sirupsen/logrus"
@@ -223,9 +224,16 @@ func TestGetGroups(t *testing.T) {
 		callCounter = map[string]int{}
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
-			lookup := make(map[string]struct{})
 
-			groups, err := conn.getGroups(testCase.userKey, testCase.fetchTransitiveGroupMembership, lookup)
+			sm := sync.Map{}
+			ctx := context.Background()
+			var groups []string
+			var err error
+			if testCase.fetchTransitiveGroupMembership {
+				groups, err = conn.getAllGroups(context.Background(), testCase.userKey, &sm)
+			} else {
+				groups, err = conn.getGroups(ctx, testCase.userKey, &sm)
+			}
 			if testCase.shouldErr {
 				assert.NotNil(err)
 			} else {
